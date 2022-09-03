@@ -1,0 +1,1614 @@
+#!/bin/sh
+
+###>>>
+###>>>   Tiny Core Extension audit script - www.tinycorelinux.net
+###>>>
+###>>>   Copyright (C) 2015 The Core Project & Tiny Core Linux Team (www.tinycorelinux.net) 
+###>>>   
+###>>>   This program is free software; you can redistribute it and/or
+###>>>   modify it under the terms of the GNU General Public License
+###>>>   as published by the Free Software Foundation; either version 2
+###>>>   of the License, or (at your option) any later version.
+###>>>   
+###>>>   This program is distributed in the hope that it will be useful,
+###>>>   but WITHOUT ANY WARRANTY; without even the implied warranty of
+###>>>   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+###>>>   GNU General Public License for more details.
+###>>>   
+###>>>   You should have received a copy of the GNU General Public License
+###>>>   along with this program; if not, write to the Free Software
+###>>>   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+###>>>
+
+#<< 
+#<<  CHANGES
+#<< 
+#<<  20101206 - original written and managed by JasonW
+#<<  2010-20140210 - many updates made by coreplayer2 and gordonselfish
+#<<  20150708 - various changes by dentonlt
+#<<     query version/arch, comment code, use DEPLIST for ext loading by TC version,
+#<<     move md5 check to subroutine; work from squashfs; check net connection;
+#<<     added usage/help text, check dep file with base (not after), fix kernel grep pattern,
+#<<     re-order checking/reporting routines
+#<<  20150917 - fix grep (add -m1) in checkinfo(); kudos to gordon64 for the bug report
+#<<  20150919 - fix/rewrite perms/user/grp checking on files & dirs; 
+#<<     add "--fix" option to force repair/change to file perms on scan
+#<<     kudos to gordon64 for the bug report leading to these changes; dentonlt
+#<<  20150920 - fix Title check to ensure TESTING stays when present; check that 
+#<<     binaries have been stripped; add --strip, add -c/--color; misc cleanup; dentonlt
+#<<  20150921 - fixes to checkfileperms(); checkdiff as checklist; remove checkbasedir; 
+#<<     rewrite checkinfo; add rotdash for processes that may take awhile; fix list-making
+#<<     code (drop opening .); add checkcopyright; add checkbuilddep; dentonlt
+#<<  20151002 - remove code block in loadextensions, add dep file (thanks to coreplayer2 for
+#<<     bug reports leading to these changes); add check for copyright files in full
+#<<     extension tree (thanks coreplayer2 for this code); rm bin.list after checkstripping;
+#<<     swap order of checkmaintainer and checkinfo for clarity; dentonlt
+#<<  20151004 - fix checkfileperms() where chmod would fail; various typos fixed; adjust/ensure
+#<<     skip network checks when appropriate; fix startup script/dir permissions (kudos
+#<<     to coreplayer2 for the bug report here, too!); dentonlt
+#<<  20151005 - adjust rotdash placement in checkfileperms; add extension checking to 
+#<<     checkdeps; dentonlt
+#<<  20151007 - fix traps; create cleanonsignal(); adjust checkinfo to grep for 
+#<<     "Extension[-_]by"; dentonlt
+#<<  20151010 - checkinfo(): use both coreutils du and busybox du for size check; 
+#<<     checkdeps(): check file structure (one dep per line); dentonlt
+#<<  20151013 - add checklibs() for dynamic library checking; dentonlt
+#<<  20151017 - move info/dep checks to before squashfs cks - dep ck req'd for
+#<<     accurate checklibs(); add checkempty(); var checklibs fixes; add core/arch options
+#<<     add changes & license options (GPLv2 was in Jason W's original info file); bugfix 
+#<<     cleanonsignal (was leaving squashfs dir); dentonlt
+#<<  20160204 - updated version checking; juanito
+#<<  20160316 - add armv7l to ARCH testing, fix ARCH assignment bug (kudos andyj); 
+#<<     change release text to 'unstable', request feedback on ARM; begin 
+#<<     selfpackage() for cross-repo submission/updates; dentonlt
+#<<
+#<<  STUFF TO DO
+#<<
+#<<  * Check that checkstartup applies changes BEFORE moving on to checkfileperms
+#<<  * search dep file for extension families (ie: don't include both child & grandchild deps)
+#<<  * if there is no startup file, but the current repository extension has one ... warn.
+#<<  * check for PPI compatibility [deprecated?]
+#<<  * if usr/local/share/applications/ is included, expect $F.desktop and icon 
+#<<  * if usr/local/share/pixmaps/ included, expect $F.png (icon file)
+#<<  * checktgz should check the content and structure of the tgz file (should this be xz?)
+#<<  * since this is a large script with many functions ...
+#<<    consider splitting it into smaller scripts (eg tc-ext-perms, tc-ext-startup, etc)
+#<<    that each check an area of settings and make adjustments as needed. Then use
+#<<    submitqc to call on those other scripts (and refer user to other scripts
+#<<    to check and fix individual issues/areas)
+#<<
+
+####################
+# SETUP
+####################
+
+RUNDIR="$PWD"
+SCRIPT=$(basename $0)
+VERSIONSTRING="20151017"
+  [ "echo $VERSIONSTRING | grep "DATE"" ] && VERSIONSTRING="SOURCE RUN"
+
+# handle cmdline args
+for i in $*
+do
+  case $i in
+    -c) . /etc/init.d/tc-functions ;;
+    --color) . /etc/init.d/tc-functions ;;
+    --kernel=*) KVER="${i#--kernel=}"; KERNELFORCE=1 ;;
+    --core=*) TCVER="${i#--core=}" ;;
+    --arch=*) ARCH="${i#--arch=}" ;;
+    --nonet) INET="nonet" ;;
+    --libs) LIBCHECK=1 ;;
+    -?) USAGE=1 ;;
+    -h) USAGE=1 ;;
+    --help) USAGE=1 ;;  
+    --tcz=*) TCZLIST="$(basename ${i#--tcz=} .tcz).tcz" ;;
+    --fix) FIXFILES=1 ;;
+    --strip) STRIP=1 ;;
+    --self-package) PACKAGING=1 ;; 
+    --changes) cat $(which $0) | grep "^#<<" | sed 's/^#<<//' ; exit ;;
+    --license) cat $(which $0) | grep "^###>>>" | sed 's/^###>>>//' ; exit ;; 
+    *) # might be an extension filename/base
+       [ -e $(basename ${i} .tcz).tcz ] && TCZLIST=$(basename ${i} .tcz).tcz
+       ;;
+  esac
+done
+
+# set up list of extensions to check
+
+if [ "$TCZLIST" ] && [ "$(dirname $TCZLIST)" != "." ]; then
+  echo "Run $SCRIPT in the same directory as your extension(s)."
+  exit 1 
+fi 
+
+[ -z "$TCZLIST" ] && TCZLIST="$(find -maxdepth 1 -name "*.tcz" | sed 's/^\.\///')"
+[ -z "$KVER" ] && KVER="$(uname -r)"
+[ -z "$TCVER" ] && TCVER="$(version | sed 's/\..*//')"
+TCVER=${TCVER%%.*}.x
+
+# output usage
+
+if [ ! "$PACKAGING" ]; then
+if [ ! "${TCZLIST}" ] || [ "$USAGE" ]; then
+  echo ""
+  echo "submitqc is the Tiny Core extension submission quality testing tool."
+  echo "This unstable release ($VERSIONSTRING) is UNDER TESTING for TC5+, x86/x86_64/armv7."
+  echo "In particular, feedback/testing on Pi/ARM usage is welcome!"
+  echo ""
+  echo "Usage: $SCRIPT [-?|-h|--help] [--kernel=KVER] [--nonet] [--fix] \
+          [--tcz=TCZFILE] [TCZFILE] [--changes] [--license]" | fmt -w 75 -u -t
+  echo "" 
+  echo "Run $SCRIPT in the same directory as your extension(s). It will find & \
+  test tcz files in the run directory." | fmt -w 75 -ut
+  echo ""
+  echo "Options:"
+  echo ""
+  echo -e "\t-c --color\tUse colored text output"
+  echo -e "\t--kernel=KVER\tTest modules using KVER (default: \`uname -r\`)"
+  echo -e "\t--core=TCVER\tRefer to online repo for core TCVER (default: \`version\`)"
+  echo -e "\t--arch=ARCH\tRefer to online repo for architecture ARCH (default: \`uname -m\`)"
+  echo -e "\t--libs\t\ttry dynamic library inclusion tests (unstable; time-consuming)"
+  echo -e "\t--nonet\t\tdisable network-based checks"
+  echo -e "\t--fix\t\tFix chmod/chown inconsistencies (default: warn)"
+  echo -e "\t--strip\t\tstrip any unstripped binaries (default: warn)"
+  echo -e "\t--changes\tview change and planning details" 
+  echo -e "\t--self-package\tself-package under /tmp/${SCRIPT}-pkg/" 
+  echo -e "\t--license\tview license details (GNU GPLv2)" 
+  echo ""
+  echo "$SCRIPT is distributed under the terms of the GNU GPLv2. see --license."
+  echo ""
+  exit 0  
+fi
+fi
+
+# library/dep checking variables
+[ -z "$ARCH" ] && ARCH=$(uname -m)
+RAND="$(date +%s | md5sum | head -c4)"
+REPO=/etc/sysconfig/tcedir/optional
+REQLOG=/tmp/$SCRIPT/$$-$RAND.req # libs req'd
+INCLOG=/tmp/$SCRIPT/$$-$RAND.dep # libs in deps
+REPOLOG=/tmp/$SCRIPT/$$-$RAND.repo # libs in repo missing from extension 
+MIRROR="$(cat /opt/tcemirror)"
+unset LIBS
+unset CHECKLIST
+
+# prepare TEMPLIST - used during signal trap cleanup
+TEMPLIST="$REQLOG $INCLOG $REPOLOG *.dep-mirror" 
+
+# this is used during checklibs() to ignore dependency on system libs 
+BASELIBS="ANSI_X3.110.so ISO8859-1.so ISO8859-15.so ISO8859-2.so UNICODE.so ld-2.20.so libanl-2.20.so libanl.so libanl.so.1 libblkid.so libblkid.so.1 libblkid.so.1.1.0 libc-2.20.so libc.so.6 libcom_err.so libcom_err.so.2 libcom_err.so.2.1 libcrypt-2.20.so libcrypt.so libcrypt.so.1 libdl-2.20.so libdl.so libdl.so.2 libe2p.so libe2p.so.2 libe2p.so.2.3 libext2fs.so libext2fs.so.2 libext2fs.so.2.4 libgcc_s.so libgcc_s.so.1 libm-2.20.so libm.so libm.so.6 libnsl-2.20.so libnsl.so libnsl.so.1 libnss_compat-2.20.so libnss_compat.so libnss_compat.so.2 libnss_dns-2.20.so libnss_dns.so libnss_dns.so.2 libnss_files-2.20.so libnss_files.so libnss_files.so.2 libpthread-2.20.so libpthread.so.0 libresolv-2.20.so libresolv.so libresolv.so.2 librt-2.20.so librt.so librt.so.1 libstdc++.so libstdc++.so.6 libstdc++.so.6.0.20 libsudo_noexec.so libsysfs.so libsysfs.so.2 libsysfs.so.2.0.1 libutil-2.20.so libutil.so libutil.so.1 libuuid.so libuuid.so.1 libuuid.so.1.3.0 libz.so libz.so.1 libz.so.1.2.8 sudo_noexec.so"
+
+case "$ARCH" in
+   x86_64) BASELIBS="$BASELIBS ld-linux-x86-64.so.2 linux-vdso.so.1" ;;  
+   i686) BASELIBS="$BASELIBS ld-linux.so.2 linux-gate.so.1"; ARCH="x86" ;;
+   x86) BASELIBS="$BASELIBS ld-linux.so.2 linux-gate.so.1" ;;
+   armv7l) BASELIBS="$BASELIBS ld-linux-armhf.so.3 linux-vdso.1"; ARCH="armv7";; 
+   aarch64) BASELIBS="$BASELIBS ld-linux-aarch64.so.1 linux-vdso.1"; ARCH="aarch64";;
+   *) echo "$SCRIPT: Unrecognized architecture '$ARCH'. See --help." && exit 1 ;;
+esac
+
+# other global variables
+REPO_URL="$(cat /opt/tcemirror)$TCVER/$ARCH/tcz"
+CHANGES= # when script makes changes to extension, remember to rebuild
+
+####################
+####################
+# SUPPORT FXNS
+####################
+####################
+
+# clean up on failed run
+cleanonsignal() {
+
+ # remove traps, in case this function fails
+ trap - SIGHUP SIGINT SIGQUIT SIGTERM SIGSTOP SIGABRT
+
+ echo
+ echo -e "\tCaught interrupt." 
+ echo -en "\tKilling subprocesses ... " 
+ sudo pkill -P $$ # kill any subprocesses (children of this process)
+ wait $$
+ echo "Ok." 
+ 
+ echo -en "\tCleaning up temp files ... "
+
+ [ "$TEMPLIST" ] && \
+ for E in $TEMPLIST; do
+   if [ -e /tmp/submitqc/$E ]; then
+     sudo rm -rf $E || echo -en "\n\tUnknown error removing /tmp/submitqc/$E"
+   elif [ -e $RUNDIR/$E ]; then 
+     sudo rm -rf $RUNDIR/$E || echo -en "\n\tUnknown error removing $RUNDIR/$E"
+   fi
+ done
+ echo "Ok."
+
+ echo -e "\tLogs at /tmp/$SCRIPT will be removed on next run."
+ echo -e "\tExiting early."
+ exit 1
+ 
+}
+
+# announce script
+announce() {
+  echo ""
+  echo "=============================================================="
+  echo "This is the Tiny Core extension submission quality testing tool."
+  echo "This pre-release is UNDER TESTING for TC5/6 and x86/x86_64."
+  echo ""
+  echo "see --help for usage instructions."
+  echo ""
+  echo "Release: $VERSIONSTRING"
+  echo "=============================================================="
+  echo ""
+  echo "${GREEN}Checking against Core release $TCVER on $ARCH / $KVER ${NORMAL}"
+  echo ""
+}
+
+# self-packaging - cool!
+selfpackage() {
+
+  if [ "${TCVER%%.*}" -gt 5 ]; then
+    tce-load -i squashfs-tools
+    [ $? != 0 ] && echo "Need squashfs-tools!" && exit 1
+  else
+    tce-load -i squashfs-tools-4.x
+    [ $? != 0 ] && echo "Need squashfs-tools-4.x!" && exit 1
+  fi
+
+  if [ "${ARCH}" != "armv7" ]; then
+    tce-load -i zsync
+    [ $? != 0 ] && echo "Need zsync!" && exit 1
+  fi
+  
+  # package this script for each repo ... 
+  mkdir -p /tmp/${SCRIPT}-pkg
+
+  # get info file ... =)
+  if [ ! -e ${SCRIPT}.info ]; then 
+    wget $(cat /opt/tcemirror)7.x/x86_64/tcz/${SCRIPT}.tcz.info 
+    [ $? != 0 ] && echo "$SCRIPT: error fetching .info file - can't package!" && return 1
+  else
+    cp -f $SCRIPT.info /tmp/${SCRIPT}-pkg/$SCRIPT.tcz.info
+  fi
+
+  echo "Changes must be manually entered into the script itself. Info file editing, however,"
+  echo "is automated here."
+  read -p "Text for 'Current:' line in info file (enter single space for no change to info file): " APPEND
+
+  for CPU in armv7 x86 x86_64; do
+  for VER in 5 6 7; do
+ 
+    # no armv7 5.x repo 
+    set -x
+    [ "$VER" -lt 6 ] && [ "$CPU" = "armv7" ] && continue 
+    set +x
+  
+    # clean out old packages ... 
+    rm -rf /tmp/${SCRIPT}/$CPU/$VER
+    rm -rf /tmp/${SCRIPT}-pkg/$CPU/$VER
+ 
+    # place script
+    mkdir -p /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/bin/
+    cp -f ${0} /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/bin/
+    sudo chown root:root /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/bin/${SCRIPT}
+    sudo chmod 755 /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/bin/${SCRIPT}
+    
+    # place copyright text
+    mkdir -p /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/share/doc/${SCRIPT}
+    cat ${0} | grep "###>>>" | sed 's/^###>>>//' > \
+      /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/share/doc/${SCRIPT}/COPYING 
+    sudo chown root:root /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/share/doc/${SCRIPT}/COPYING
+    sudo chmod 644 /tmp/${SCRIPT}/$CPU/$VER/root/usr/local/share/doc/${SCRIPT}/COPYING
+ 
+    #set dir perms ...
+    find /tmp/${SCRIPT}/$CPU/$VER/root -type d \
+       -exec sudo chown root:root {} \;
+    find /tmp/${SCRIPT}/$CPU/$VER/root -type d \
+       -exec sudo chmod 755 {} \;
+ 
+    # create DEP file ...
+    DEPLIST="file diffutils wget coreutils grep binutils"
+    if [ "$VER" -gt "5" ]; then
+      DEPLIST="$DEPLIST squashfs-tools"
+    else
+      DEPLIST="$DEPLIST squashfs-tools-4.x"
+    fi
+   
+    if [ "$CPU" != "arm" ]; then
+      DEPLIST="$DEPLIST zsync"
+    fi
+
+    for F in $DEPLIST; do
+      echo "$F.tcz" >> /tmp/submitqc/$CPU/$VER/submitqc.tcz.dep
+    done
+
+    # make squashfs
+    mksquashfs /tmp/${SCRIPT}/$CPU/$VER/root /tmp/${SCRIPT}/$CPU/$VER/submitqc.tcz
+
+    # make file list
+    cd /tmp/${SCRIPT}/$CPU/$VER/root/ 
+    find -not -type d > ../${SCRIPT}.tcz.list
+    sed -i 's/^\.//' ../${SCRIPT}.tcz.list # drop opening '.'
+    cd -
+    
+    # remove installation tree
+    sudo rm -rf /tmp/${SCRIPT}/$CPU/$VER/root
+ 
+    # make md5sum ...
+    cd /tmp/${SCRIPT}/$CPU/$VER
+    md5sum ${SCRIPT}.tcz > /tmp/${SCRIPT}/$CPU/$VER/${SCRIPT}.tcz.md5.txt
+    cd -
+
+    if [ "$ARCH" != "armv7" ]; then
+      # make zsync
+      cd /tmp/${SCRIPT}/$CPU/$VER
+      zsyncmake -u ${SCRIPT}.tcz ${SCRIPT}.tcz
+      cd -
+    fi
+
+    if [ "$APPEND" ] && [ ! "$APPEND" = " " ]; then
+      # append updated change details to info file ... 
+      grep -v "Current:" ${SCRIPT}.tcz.info > \
+        /tmp/${SCRIPT}/$CPU/$VER/${SCRIPT}.tcz.info 
+      echo -e "\t\t\t\t$(grep "Current:" $SCRIPT.tcz.info | \
+        sed 's/^Current:[ \t]*//')" >> \ 
+        /tmp/${SCRIPT}/$CPU/$VER/$SCRIPT.tcz.info 
+   
+      echo -e "\nCurrent:\t\t$(date +%Y/%m/%d) $APPEND" >> \
+        /tmp/${SCRIPT}/$CPU/$VER/$SCRIPT.tcz.info
+    else
+      cp /tmp/${SCRIPT}-pkg/${SCRIPT}.tcz.info /tmp/${SCRIPT}/$CPU/$VER/
+    fi 
+
+    # create tar ...
+    cd /tmp/$SCRIPT/$CPU/$VER/ 
+    tar -czf ${SCRIPT}.tar.gz *
+    cd - 
+
+  done # per TC repo 
+  mv /tmp/$SCRIPT/$CPU /tmp/${SCRIPT}-pkg/
+  done # per arch 
+
+  rm /tmp/${SCRIPT}-pkg/${SCRIPT}.tcz.info
+
+  echo 
+  echo "${SCRIPT}: Ok! See /tmp/${SCRIPT}-pkg subdirectories for individual extensions."
+  return 0
+
+}
+
+# load extensions
+loadextensions() {
+
+  echo -n "${BLUE}$SCRIPT: loading required extensions ... ${NORMAL}" 
+
+  # load dependencies
+  if [ "$(version | sed 's/\..*//')" -gt "5" ]; then
+    DEPLIST="file diffutils squashfs-tools wget coreutils grep"
+  else
+    DEPLIST="file diffutils squashfs-tools-4.x wget coreutils grep"
+  fi
+
+  # not available on arm at 20160316 
+  [ ! "$ARCH" = "armv7" ] && DEPLIST="$DEPLIST zsync binutils"
+ 
+  for FILE in $DEPLIST; do
+    if [ ! -e "/usr/local/tce.installed/$FILE" ]; then
+      tce-load -i $FILE 
+      [ $? != 0 ] && echo "${RED}$SCRIPT: Error in tce-load. Halting ${NORMAL}" && exit 1
+    fi
+  done
+  echo "${GREEN}Done.${NORMAL}"
+
+}
+
+# remove/clear old log files ...
+cleanuplogs() {
+
+  echo -n "${BLUE}$SCRIPT: removing old log files. ${NORMAL}"
+  rm -rf /tmp/submitqc
+
+  echo "${GREEN}Ok.${NORMAL}"
+  
+  echo -n "${BLUE}$SCRIPT: making space for new log files. ${NORMAL}"
+  mkdir -p /tmp/submitqc/missingdeps
+ 
+  echo "${GREEN}Done.${NORMAL}"
+
+}
+
+# check that network connection (mirror) is up
+checknetwork() {
+
+  # test for network connection - needed for for checking against repository ...
+  if [ "$INET" = "nonet" ]; then
+    echo -n "${YELLOW}$SCRIPT: '--nonet': networking disabled on command line. ${NORMAL}"
+    INET=
+    return
+  fi
+
+  URL=${REPO_URL}/info.lst.gz
+
+  OLDLIST="$TEMPLIST"
+  TEMPLIST="$TEMPLIST cnxn.test"
+  ( 
+    echo -n "${BLUE}$SCRIPT: checking $(cat /opt/tcemirror) (timeout 3 sec) ... ${NORMAL}"
+    wget --spider -q --timeout=3 ${URL} 2>&1 > /dev/null 
+    if [ $? = 0 ]; then echo "exists" > /tmp/submitqc/cnxn.test 
+    else echo "down" > /tmp/submitqc/cnxn.test
+    fi
+  ) &
+  rotdash $!
+
+  [ -e "/tmp/submitqc/cnxn.test" ] && \
+    [ -n "$(grep "exists" /tmp/submitqc/cnxn.test)" ] && INET=1
+  rm -f /tmp/submitqc/cnxn.test
+  TEMPLIST="$OLDLIST"
+
+  # download list of available extensions 
+  if [ $INET ]; then
+    echo "${GREEN}Connected!${NORMAL}"
+    {
+    echo -n "${BLUE}$SCRIPT: fetching info.lst.gz ... ${NORMAL}"
+    wget -q -O /tmp/submitqc/.info.lst.gz ${URL} &&\
+    gunzip /tmp/submitqc/.info.lst.gz && \
+    sed -i 's:.tcz::g' /tmp/submitqc/.info.lst 
+    } || {
+    echo -e "\n${YELLOW}Error in fetch - some tests will be skipped.${NORMAL}"
+    INET=
+    } 
+    echo "${GREEN}Ok.${NORMAL}"
+  else
+    echo -e "\n\t${YELLOW}Connection or mirror down - some tests will be skipped.${NORMAL}"
+  fi
+
+}
+
+# check that the extension mounts alright
+checkmount() {
+
+  echo -n "${BLUE}$SCRIPT: ${F} mountable? ${NORMAL}"
+
+  # if SQUASHDIR it just happens to already exist ... get rid of it
+  df | grep "$SQUASHDIR" > /dev/null 2>&1 && sudo umount "$SQUASHDIR"
+  rm -rf /tmp/submitqc/"$SQUASHDIR"
+  
+  # if file is not a squashfs ... skip it.
+  if [ "$(file ${F} | grep 'Squashfs' | cut -f1 -d':')" != "$F" ]; then
+    echo "${RED} Not a valid tcz - not squashfs. Remake.${NORMAL}" 
+    echo $F >> /tmp/submitqc/corrupttcz
+    return 1
+  fi 
+
+  # try to mount 
+  (
+  mkdir -p "${SQUASHDIR}"
+  sudo mount -o loop ${F} ${SQUASHDIR} 2>&1 > /dev/null 
+  if [ $? != 0 ]; then 
+    echo "${RED}Error mounting - remake.${NORMAL}" 
+    echo "$F" >> /tmp/submitqc/corrupttcz
+    return 1
+  fi 
+
+  # umount
+  sudo umount -d "$SQUASHDIR"
+  sleep 2
+  rm -rf "$SQUASHDIR"
+  ) &
+  rotdash $!
+
+  echo "${GREEN}Passed mount check.${NORMAL}"
+ 
+  return 0
+}
+
+# check that blocksize is 4096 
+checkblock() {
+
+  echo -n "${BLUE}$SCRIPT: ${F} correct block size? ${NORMAL}"
+
+  if ! unsquashfs -s "$F" | grep "Block size" | grep "4096" > /dev/null; then
+    echo "${YELLOW}Not in 4096 block size. Extension will be rebuilt.${NORMAL}"
+    CHANGES=1
+  else
+    echo "${GREEN}Yes.${NORMAL}"
+  fi
+
+} # end checkblock()
+
+# check that squashfs has something in it
+checkempty() {
+  
+  echo -n "${BLUE}$SCRIPT: ${F} squashfs tree has files in it? ${NORMAL}"
+
+  if [ "$(unsquashfs -ls $F | grep squashfs-root | wc -l)" = "1" ]; then
+    echo -e "\n\t${RED}It appears $F is empty! Remake.${NORMAL}"
+    echo "$F" >> /tmp/submitqc/emptysquashfs
+    return 1
+  fi   
+
+  echo "${GREEN}Ok.${NORMAL}"
+  return 0
+
+}
+
+# check for excess (or missing) file trees inside of squashfs
+checkappend() {
+
+  echo -n "${BLUE}$SCRIPT: ${F} squashfs tree ok? ${NORMAL}"
+
+  if [ "$(find -maxdepth 1 -name 'usr_')" ]; then  
+    echo "${RED} It appears $F contains more than one squashfs tree. Remake.${NORMAL}"
+    echo "$F" >> /tmp/submitqc/appendeddata
+    return 1
+  fi
+
+  echo "${GREEN}Ok.${NORMAL}"
+  return 0
+
+} # end checkappend()
+
+# if ext has a startup file, check startup name, permissions, location, etc.
+checkstartup() {
+ 
+  echo -n "${BLUE}${SCRIPT}: ${F} startup files ok? ${NORMAL}"
+
+  if [ ! -d usr/local/tce.installed/ ]; then
+    echo "${GREEN}None present. Ok, I think.${NORMAL}"
+    return # no startup script
+  fi
+
+  # count files in startup script dir; get name of startup script
+  SSDIR="usr/local/tce.installed/"
+  SS="$(ls -A $SSDIR)" 
+  COUNT="$(echo "$SS" | wc -l)" 
+
+  # is there only 1 startup file, named same as extension?
+  case $COUNT in
+    0)  echo -e "${RED}Has startup folder but no script. Repair manually.${NORMAL}" 
+ 	echo -e "${F}: startup folder without script. Repair manually." \
+		>> /tmp/submitqc/startupscript
+        ;;
+    1)  if [ "${SS}" != "${BASENAME}" ]; then
+          echo -ne "\n${YELLOW}script name ($SS) is incorrect. Renaming ${BASENAME}. ${NORMAL}"
+          echo "$F startup named $SS renamed $BASENAME" >> /tmp/submitqc/wrongstartscriptname
+          SS="$(find $SSDIR -not -type d | tail -n 1)" 
+          mv "${SS}" "${SSDIR}${BASENAME}"
+          echo "${YELLOW}Done.${NORMAL}"
+          CHANGES=1 
+        fi
+        ;;
+    *)  echo -e "${RED}Multiple startup files, none named $F. Repair manually.${NORMAL}"
+ 	echo -e "${F}: multiple startup files, none named $F. Repair manually." \
+		>> /tmp/submitqc/startupscript
+        ;;
+  esac
+
+  DIRERROR= 
+ 
+  if [ ! "$(stat -c%a ${SSDIR})" = 775 ]; then 
+    sudo chmod 775 "usr/local/tce.installed"
+    echo -ne "\n\t${YELLOW}Startup directory permissions were corrected.${NORMAL}" 
+    DIRERROR=1
+  fi
+
+  if [ "$(stat -c'%U %G' ${SSDIR})" != "root staff" ]; then
+    sudo chown root:staff "${SSDIR}"
+    echo -ne "\n\t${YELLOW}Startup directory ownership was corrected.${NORMAL}" 
+    DIRERROR=1
+  fi
+  
+  if [ ! "$(stat -c%a ${SSDIR}/$BASENAME)" = 755 ]; then 
+    sudo chmod 755 "${SSDIR}/$BASENAME"
+    echo -ne "\n\t${YELLOW}Startup script permissions were corrected.${NORMAL}" 
+    DIRERROR=1
+  fi
+
+  if [ ! "$(stat -c'%U %G' ${SSDIR}/$BASENAME)" = "tc staff" ]; then
+    sudo chown tc:staff "${SSDIR}/$BASENAME"
+    echo -ne "\n\t${YELLOW}Startup script ownership was corrected.${NORMAL}" 
+    DIRERROR=1
+  fi
+
+  if [ $DIRERROR ]; then 
+    echo "$F" >> /tmp/submitqc/wrongstartscriptperms
+    CHANGES=1
+    echo
+  else
+    echo "${GREEN}Ok.${NORMAL}" 
+  fi
+
+} # end checkstartup()
+
+# look for COPYING or other text file at usr/local/share/doc/$BASENAME
+checkcopyright() {
+
+  echo -n "${BLUE}$SCRIPT: $F includes copyright notice? ${NORMAL}"
+  E=${BASENAME##*-}
+
+  [ ${E} = "doc" ] || [ ${E} = "locale" ] || [ ${E} = "dev" ] && \
+    echo "${GREEN}Not needed for -${F##*-}. Done.${NORMAL}" && return 
+
+  COPYRIGHTFILES="/tmp/submitqc/$F.copyrightfiles"
+
+  # look for copyright dir + files. If missing, no good.  
+  if [ ! -e "usr/local/share/doc/$BASENAME" ] \
+    || [ "$(find usr/local/share/doc/$BASENAME -type f | wc -l)" = 0 ]; then
+    MISSING=1
+  fi
+
+  if [ "$MISSING" ]; then
+    echo -e "\n\t${YELLOW}Copyright notice not found at usr/local/share/doc/$BASENAME${NORMAL}"
+    echo -e "\t${YELLOW}Confirm that this is not needed.${NORMAL}"
+
+    # courtesy: look for copyright info in tree (kudos coreplayer2 for this)
+    LICENSEFILES="license copying copyright"
+    for c in ${LICENSEFILES}; do
+      find . -type f -iname "${c}*" >> $COPYRIGHTFILES
+    done
+
+    # remove any blank lines from COPYRIGHTFILES list
+    sed -i '/^$/d' $COPYRIGHTFILES
+
+    if [ "$(cat $COPYRIGHTFILES | wc -l)" != 0 ]; then
+      echo -e "\n\t${YELLOW}Possible copyright files found:${NORMAL}" 
+      echo -e "${YELLOW}$(cat $COPYRIGHTFILES | sed 's/^/\t\t/g')${NORMAL}"
+    else
+      rm $COPYRIGHTFILES
+    fi
+    unset FOUND
+
+    if [ $INET ]; then 
+      # courtesy: check if it's in the repo copy ...
+      echo -e "\t${YELLOW}Checking repo for copyright statement in $F ...${NORMAL}" 
+      REPOLIST="/tmp/submitqc/${F}.repolist"
+      wget -O ${REPOLIST} "$REPO_URL"/"$F".list > /dev/null 2>&1
+      if [ $? = 0 ]; then
+        if [ "$(grep "usr/local/share/doc/$BASENAME" $REPOLIST)" ]; then
+          REMOTECOPYRIGHT=1
+          echo -e "\t${RED}Repository copy of $F includes a copyright statement.${NORMAL}" 
+        else
+  	  echo -e "\t${GREEN}Repo copy of $F does NOT include copyright statement.${NORMAL}"
+        fi
+      else
+        echo -e "\t${YELLOW}$F not found on server.${NORMAL}"
+      fi
+    fi
+
+    echo "$F: copyright information not found at usr/local/share/doc/$BASENAME/" >> \
+	/tmp/submitqc/copyright
+    [ $REMOTECCOPYRIGHT ] && echo -e "\tRepository copy includes a copyright statement." >> \
+  	/tmp/submitqc/copyright
+
+  else
+    echo -e "${GREEN}Looks ok.${NORMAL}"
+  fi
+
+  unset MISSING
+  unset REMOTECOPYRIGHT
+
+} # end checkcopyright
+
+# check permissions of all files/directories
+checkfileperms() {
+
+  echo -n "${BLUE}$SCRIPT: $F file/directory ownerships & permissions ok? ${NORMAL}"
+
+  LOG="/tmp/submitqc/fileperms"
+  
+  # the startup directory was tested in checkstartup(). Ignore it at this point. 
+  
+  # Find directories without root:root and/or 755. Skip tce.installed.
+  # Test all files. root:root. executables 755, others 644. Skip tce.installed.
+
+  # begin rotdash section - these finds can take awhile.
+  ( 
+  D_RR="$(find -type d -not -user root | grep -v usr/local/tce.installed; \
+    find -type d -not -group root | grep -v usr/local/tce.installed)" 
+  D_755="$(find -type d -not -perm 755 | grep -v usr/local/tce.installed)" 
+    
+  F_RR="$(find -type f -not -user root | grep -v usr/local/tce.installed; \
+    find -mindepth 1 -type f -not -group root \
+    | grep -v usr/local/tce.installed)" 
+  F_755="$(find -type f -not -perm 755 -exec file {} \; | grep 'executable' \
+    | grep -v usr/local/tce.installed; \
+    find -type f -not -perm 755 -exec file {} \; | grep 'shared object')" 
+  F_644="$(find -type f -not -perm 644 -exec file {} \; \
+    | grep -v 'executable' | grep -v 'shared object' | grep -v usr/local/tce.installed)" 
+  ) &
+  rotdash $!
+
+  if [ "${F_RR}${D_RR}" ]; then 
+    NOTRR="$(echo -e "${F_RR}\n${D_RR}" | sort | uniq)" # remove duplicates, sort
+    echo -e "\n\t${YELLOW}Expected root:root ownership:\n${NOTRR}${NORMAL}" | \
+    sed 's_^\./__' | sed '2!s_^_\t\t_' 
+  fi
+  [ "$F_755" ] || [ "$D_755" ] && \
+    echo -e "\n\t${YELLOW}Expected 755:\n${F_755}\n${D_755}${NORMAL}" | \
+    sed 's_^\./__' | sed '2!s_^_\t\t_'  
+  [ "$F_644" ] && \
+    echo -e "\n\t${YELLOW}Expected 644:\n${F_644}${NORMAL}" | \
+    sed 's_^\./__' | sed '2!s_^_\t\t_'  
+
+  if [ "$F_RR$D_RR$F_755$D_755$F_644" ]; then # write warnings to log file
+      echo "${F}: Some directory or file permissions were incorrect or non-standard." >> $LOG 
+      [ "$D_RR" ] && echo -e "Directories - Expected root:root:\n${D_RR}" >> $LOG
+      [ "$D_755" ] && echo -e "Directories - Expected 755:\n${D_755}" >> $LOG 
+      [ "$F_RR" ] && echo -e "Files - Expected root:root:\n${F_RR}" >> $LOG
+      [ "$F_755" ] && echo -e "Files - Expected 755:\n${F_755}" >> $LOG
+      [ "$F_644" ] && echo -e "Files - Expected 644:\n${F_644}" >> $LOG 
+    if [ ! $FIXFILES ]; then
+      echo -e "\t${RED}You have warnings. See /tmp/submitqc/fileperms.${NORMAL}"
+      echo -e "${RED}\tTo set defaults, run $SCRIPT with option --fix.${NORMAL}"
+      # log it:
+      echo -n "\nTo set defaults, run $SCRIPT with option --fix." >> $LOG 
+    else
+
+      # fix permission/ownership errors
+      echo -e "\t${YELLOW}fixing inconsistencies ... ${NORMAL}" 
+
+      # first, chop off all the file descriptor content - we just need file/dir names
+      F_RR="$(echo "$F_RR" | cut -f1 -d:)"
+      D_RR="$(echo "$D_RR" | cut -f1 -d:)"
+      D_755="$(echo "$D_755" | cut -f1 -d:)"
+      F_755="$(echo "$F_755" | cut -f1 -d:)"
+      F_644="$(echo "$F_644" | cut -f1 -d:)"
+
+      # echo "Files for fixing: "
+      # echo -e "\n$F_RR\n\n$D_RR\n\n$D_755\n\n$F_755\n\n$F_644"
+
+      if [ -n "$D_RR$F_RR" ]; then 
+	echo -e "\t${YELLOW}chown root:root files and directories${NORMAL}"
+        sudo chown root:root $D_RR $F_RR 
+        [ $? != 0 ] && echo -e "\n${RED}Error in chown - halting.${NORMAL}" && exit 1
+      fi
+  
+      if [ -n "$D_755$F_755" ]; then 
+	echo -e "\t${YELLOW}chmod 755 executable files and directories${NORMAL}"
+	MODETMP=/tmp/submitqc/mode-sample-$(date +%s | head -c4)
+	touch $MODETMP # using just chmod 755 doesn't adjust sticky bit
+        sudo chmod 755 $MODETMP 
+        sudo chmod --reference=$MODETMP $D_755 $F_755
+	rm -f $MODETMP 
+        [ $? != 0 ] && echo -e "\n${RED}Error in chmod - halting.${NORMAL}" && exit 1
+      fi
+
+      if [ -n "$F_644" ]; then 
+	echo -e "\t${YELLOW}chmod 644 normal files${NORMAL}"
+        sudo chmod 644 $F_644
+        [ $? != 0 ] && echo -e "\n${RED}Error in chmod - halting.${NORMAL}" && exit 1
+      fi
+
+      echo "${F}: These errors were corrected." >> $LOG 
+      touch /tmp/submitqc/changes # rebuild tcz
+      echo -e "${GREEN}Ok.${NORMAL}"
+    fi 
+    echo "" >> $LOG 
+  else 
+    echo -e "${GREEN}Ok.${NORMAL}"
+  fi
+
+  [ -e /tmp/submitqc/changes ] && CHANGES=1 && rm /tmp/submitqc/changes
+
+}
+
+# check binaries have been stripped 
+checkstripping() {
+
+  echo -n "${BLUE}$SCRIPT: $F binaries have been stripped? ${NORMAL}"
+
+  # get a list of all un-stripped binaries.
+  (
+   find -type f -exec file {} \; | grep 'not stripped' | cut -f1 -d: | sort | uniq \
+   > /tmp/submitqc/bin.list
+  ) &
+  rotdash $! 
+
+  BIN="$(cat /tmp/submitqc/bin.list)"
+
+  if [ "$BIN" ]; then
+    echo -e "\n\t${YELLOW}Some binaries have not been stripped:${NORMAL}"
+    echo "${YELLOW}$BIN${NORMAL}" | sed "s_\./_\t_" | sed "2!s_^_\t_"
+    
+    if [ "$STRIP" ]; then
+      echo -en "\t${YELLOW}Fixing ... ${NORMAL}"
+      sudo strip --strip-all ${BIN} # need sudo due to root:root ownership 
+      [ $? != 0 ] && echo -e "\n${RED}Error in strip. Halting.${NORMAL}" && exit 1 
+      echo -e "${YELLOW}Done.${NORMAL}" 
+      # log the fixes
+      echo "Some unstripped binaries were stripped:" >> /tmp/submitqc/stripping
+      echo "$BIN" >> /tmp/submitqc/stripping	
+      CHANGES=1 # rebuild tcz
+    else 
+      echo -e "\t${YELLOW}This may be intentional. Else to strip, use --strip.${NORMAL}"
+
+      # log the file list
+      echo "$F: Some binaries are not stripped:" >> /tmp/submitqc/stripping
+      echo "$BIN" | sed "s/^/\t/g" >> /tmp/submitqc/stripping	
+    
+      echo -e "\t${RED}You have warnings.${NORMAL}"
+    fi
+  else
+    echo "${GREEN}Ok.${NORMAL}"  
+  fi
+
+  rm /tmp/submitqc/bin.list
+  unset BIN
+ 
+}
+
+# check maintainer=submitter, look for extensions with similar names
+checkmaintainer() {
+
+  if [ ! $INET ]; then
+    echo -e "${YELLOW}${SCRIPT}: $F Network/mirror down. Skipping repo .info file comparison.${NORMAL}"
+    return 
+  fi
+
+  echo -n "${BLUE}$SCRIPT: $F info similar to others in repository? ${NORMAL}"
+
+  # if extension is in repository, check submitter = maintainer, warn if not same 
+  wget -O /tmp/submitqc/.${F}.info "${REPO_URL}/${F}.info" > /dev/null 2>&1 
+  if [ $? = 0 ]; then 
+    MAINTAINER="$(grep -G "Extension.by" /tmp/submitqc/.${F}.info | awk '{print $2}')"
+    [ -e ${F}.info ] && SUBMITTER="$(grep -G "Extension.by" "$F".info | awk '{print $2}')"
+    if [ "${MAINTAINER}" != "${SUBMITTER}" ]; then
+    echo -e "\n\t${YELLOW}Ensure current/past maintainer ${MAINTAINER} knows you are updating ${F}.${NORMAL}" 
+    echo "Extension: $F" >> /tmp/submitqc/tcemaintainer
+    echo "Maintainer: $MAINTAINER" >> /tmp/submitqc/tcemaintainer
+    echo "Submitter: $SUBMITTER" >> /tmp/submitqc/tcemaintainer
+    echo "---" >> /tmp/submitqc/tcemaintainer
+    fi
+  fi
+  
+  rm -f /tmp/submitqc/.${F}.info
+
+  # look for similarly named extensions, warn user  
+  SIMILAR="$(grep -e $BASENAME /tmp/submitqc/.info.lst)" 
+
+  if [ -n "$SIMILAR" ]; then
+    echo "$F: similarly named extensions:" >> /tmp/submitqc/similarextensions
+    echo "$SIMILAR" | sed 's/^/\t/' | sort | uniq >> /tmp/submitqc/similarextensions
+    echo "---" >> /tmp/submitqc/similarextensions 
+    echo -e "\n\t${YELLOW}There are similar named extensions in repo:${NORMAL}"
+    echo "${YELLOW}$SIMILAR" | sed 's/^/\t/'
+    echo -e "\t${YELLOW}Ensure there are no conflicts between $F and other extensions.${NORMAL}"
+  else
+    echo -e "${GREEN}Ok.${NORMAL}"
+  fi 
+
+} # end checkmaintainer()
+
+# compare ext.list to same from repo. Note/announce differences.
+checklist() {
+
+  echo -n "${BLUE}${SCRIPT}: ${F} list file looks ok? ${NORMAL}"
+  
+  # set up
+  rm -f /tmp/submitqc/listfilediffs/"$F".difflist
+  mkdir -p /tmp/submitqc/listfilediffs/
+  ORIG="../${F}.list"
+  LIST="/tmp/submitqc/listfilediffs/${F}.list.tmp"
+  NEWLIST="/tmp/submitqc/listfilediffs/${F}.list.new"
+  REPOLIST="/tmp/submitqc/${F}.repolist"
+  LOG="/tmp/submitqc/listfilediffs/${F}.difflist"
+
+  # make 'definitive' file list
+  find -not -type d | sort | sed 's/^\.//' > ${NEWLIST}
+
+  # if list exists, check it matches what's actually in the squashfs
+  if [ ! -e "${ORIG}" ]; then
+    echo -ne "\n\t${YELLOW}${F}.list missing. Creating ... ${YELLOW}"
+    cp $NEWLIST $ORIG
+    echo "${YELLOW}Done. ${NORMAL}"
+  else 
+    sort < $ORIG > $LIST 
+    if [ "$(diff -u $LIST $NEWLIST)" ]; then
+      echo -ne "\n\t${YELLOW}${F}.tcz.list does not match extension content. \
+Making new ${F}.list ... ${NORMAL}"
+      cp -f $NEWLIST $ORIG
+      echo "${YELLOW}Done.${NORMAL}"
+      echo "$F.list was rebuilt by $SCRIPT" >> $LOG 
+    else
+      echo "${GREEN}Ok.${NORMAL}"
+    fi 
+  fi
+
+  # now check it against the online/repo copy
+  if [ ! $INET ]; then
+    echo -e "${YELLOW}$SCRIPT: $F Network/mirror down. Skipping repo .list comparison. ${NORMAL}"
+  else 
+    echo -n "${BLUE}$SCRIPT: ${F} comparing list to mirror copy. ${NORMAL}"
+    wget -O ${REPOLIST}.tmp "$REPO_URL"/"$F".list > /dev/null 2>&1
+    if [ $? != 0 ]; then
+      echo "${GREEN}Not on mirror. ${NORMAL}"
+    else
+
+      sort < ${REPOLIST}.tmp > $REPOLIST
+      if [ "$(diff -u $LIST $REPOLIST)" ]; then 
+        DIFFERS=1 
+        diff -NBa -U 0  $REPOLIST $LIST >> $LOG
+      sed -i '1,3d' $LOG
+      sed -i '1i ---' $LOG
+      sed -i '1i Minus is in repo list only' $LOG
+      sed -i '1i Plus is in your list only' $LOG
+      echo -e "\n\t${YELLOW}${F}.list differs from repo list.\n\tSee $LOG.${NORMAL}"
+      else
+        echo "${GREEN}Matches!${NORMAL}"
+      fi
+
+    fi
+  fi
+
+  # clean up our mess      
+  rm -f $REPOLIST ${REPOLIST}.tmp $LIST $NEWLIST
+
+} # end checklist()
+
+# list all libs included in $1 and deps, fill INCLOG
+getinclibs() {
+  
+  # skip if we've already checked this file. Note if we haven't.   
+  echo $CHECKLIST | grep -q " $1" && return 
+    # echo -e "\nskip $1 re-check" && return # avoid re-checking already checked 
+  CHECKLIST="$CHECKLIST $1"
+
+  # if $1 exists
+  if [ -e $1 ]; then
+    EXT="$1"
+  elif [ -e $REPO/$1 ]; then
+    EXT="$REPO/$1"
+  else 
+    echo -e "\n\tWARNING: dependency $1 missing - tests will be inconclusive."
+    LIBTESTERROR=1
+    return 1
+  fi  
+
+  # list libs, append to INCLOG. First grep is remove header output from unsquashfs
+  for LIB in $(unsquashfs -ls $EXT | grep "squashfs-root" | grep "\.so"); do
+    echo $(basename $LIB) >> $INCLOG
+  done
+
+  # recurse deps
+  [ -e ${EXT}.dep ] && \
+  for INC in $(cat ${EXT}.dep); do
+    getinclibs $INC 
+  done
+
+}
+
+# search local repo for missing libs, fill REPOLOG
+searchlocallibs() {
+  
+  echo
+  echo -e "\t${BLUE}Searching local repo for missing libs ... ${NORMAL}"
+
+  # list local repo, lib extensions first
+  REPOFILES="$(find $REPO -maxdepth 1 -name "lib*.tcz"; find $REPO -maxdepth 1 -name "*.tcz" | grep -v "/lib*.tcz")"
+
+  # try to find missing libs in repository
+  for FILE in $REPOFILES; do 
+
+    unset FOUND 
+    FILELIST="$(unsquashfs -ls $FILE)"
+    for REQ in $(cat $REQLOG); do
+      if $(echo $FILELIST | grep -q "usr/local/lib/$REQ"); then
+        echo -e "\t$REQ found in $(basename $FILE)."
+        echo $(basename $FILE) >> $REPOLOG
+        FOUND=1
+      fi
+    done # loop search for missing libs
+
+  done # loop look for each missing lib
+
+}
+
+# cull deps of $1 from REPOLOG 
+culldeps() {
+
+  # skip if we've already checked this file. Note if we haven't.   
+  echo $CHECKLIST | grep -q " $1" && return 
+  CHECKLIST="$CHECKLIST $1"
+
+  # if $1 exists
+  if [ -e ${1} ]; then
+    EXT="${1}"
+  elif [ -e $REPO/${1} ]; then
+    EXT="$REPO/${1}"
+  fi 
+ 
+  # recurse through dep file. Remove all children of $1 from REPOLOG
+  [ -e ${EXT}.dep ] && \
+  for REM in $(cat ${EXT}.dep); do
+    sed -i "/^$REM$/d" $REPOLOG
+    culldeps $REM 
+  done
+
+}
+
+# check that local dep file matches mirror. Else testing may be invalid.
+checkmirror() {
+
+  if [ -z "$INET" ]; then
+    echo -en "${YELLOW}\tNo network connection - skip online dep comparison.${NORMAL}"
+    return
+  fi
+
+  echo
+  echo -en "\t${BLUE}Compare local $1.dep to online copy ... ${NORMAL}"
+
+  TMPCP=/tmp/$SCRIPT/$1.dep-mirror
+
+  wget -q --spider $MIRROR/${TCVER%%.*}.x/${ARCH}/tcz/${1}.dep
+  [ $? != 0 ] && echo -e "${YELLOW}Not on mirror - skip check.${NORMAL}" && return
+
+  wget -q -O $TMPCP $MIRROR/${TCVER%%.*}.x/${ARCH}/tcz/${1}.dep 
+  [ $? != 0 ] && echo -e "${YELLOW}wget error - skip check.${NORMAL}" && return
+
+  if [ $(diff $1.dep $TMPCP) ]; then
+    echo -e "${RED}Mismatch. Test likely inaccurate. diff:${NORMAL}"
+    diff -u $1.dep $TMPCP | sed 's/^/\t/' 
+  else
+    echo -e "${GREEN}matches!${NORMAL}"
+  fi
+
+  rm -f $TMPCP 
+
+}
+
+# check binaries for dependent libs. Ensure those libs are covered by the dep file or
+# included binaries
+checklibs() {
+ 
+  LOG="/tmp/$SCRIPT/missingdeps/$F.dep-libs"
+
+  if [ ! "$LIBCHECK" ]; then
+    echo "${YELLOW}$SCRIPT: ${F} to enable library inclusion tests, use --libs.${NORMAL}" 
+    echo -e "\t${YELLOW}Without lib tests, check is considered incomplete.${NORMAL}"
+    echo -n "$SCRIPT: ${F} library inclusion disabled on commandline." >> $LOG 
+    return
+  fi 
+
+  echo -n "${BLUE}$SCRIPT: ${F} dep file includes all necessary libraries? ${NORMAL}"
+  unset LIBTESTERROR
+
+  # so that various cat/sed calls do not err out
+  touch $REPOLOG $REQLOG $INCLOG
+
+  # list req'd libs (to temp file)
+  (
+  find -type f -exec file {} \; | grep 'shared libs' | cut -f1 -d: | xargs ldd | \
+    awk '{print $1}' | sed 's/.*\///' | sort | uniq > $REQLOG
+  ) &
+  rotdash $!
+
+  # need to step out of squashfs for remainder of this check
+  FSDIR="$PWD"
+  cd ..
+
+  # list included libs (to temp file)
+  getinclibs ${F}
+
+  # remove all included libs from $REQLOG
+  for LIB in $([ -e "$INCLOG" ] && cat $INCLOG) $BASELIBS; do
+    sed -i "/^$(basename ${LIB})$/d" $REQLOG 
+  done
+
+  if [ -e "${REQLOG}" ]  && [ "$(wc -l $REQLOG | cut -f1 -d' ')" != 0 ]; then 
+  
+    echo -e "\n\t${RED}Missing:${NORMAL}"
+    cat $REQLOG | sed 's/^/\t/'
+
+    echo "$F requires these libs, but they are not included:" >> $LOG
+    cat $REQLOG >> $LOG 
+  
+    checkmirror ${F}
+  
+    searchlocallibs
+  
+    unset CHECKLIST
+    for EXT in $(cat $REPOLOG); do
+      culldeps $EXT
+    done
+ 
+    if [ "$(cat $REPOLOG | wc -l)" != 0 ]; then 
+    
+      echo
+      echo -e "\t${YELLOW}Suggested additions to dep file:${NORMAL}"
+      cat $REPOLOG | sort | uniq > $REQLOG
+      cat $REQLOG | sed 's/^/\t/'
+
+      echo -e "\nSuggested additions to $F.dep:" >> $LOG
+      cat $REQLOG >> $LOG
+      echo >> $LOG
+ 
+      if [ $FIXFILES ]; then
+        cat $REQLOG >> ${F}.dep
+        echo -e "\t${YELLOW}These were added to $PWD/${F}.dep.${NORMAL}"
+        echo "These were added to ${F}.dep:" >> $LOG
+        cat $REQLOG >> $LOG
+      else
+        echo -e "\t${YELLOW}Use --fix to append these to ${F}.dep${NORMAL}"
+      fi
+    else
+      echo -e "\t${YELLOW}No additions from local repo suggested.${NORMAL}"
+    fi
+ 
+    RET=1 
+   
+  else
+    echo -e "${GREEN}Ok!${NORMAL}"
+    RET=0
+  fi
+ 
+  [ $LIBTESTERROR ] && echo -e "\n\tWARNING: error during tests - inconclusive"
+  rm -f $REPOLOG $REQLOG $INCLOG
+
+  # return to squashfs root for remainder of checks
+  cd $FSDIR 
+
+  return $RET
+ 
+}
+
+checkremotedep() {
+  
+  if [ ! "$INET" ]; then 
+    echo -e "${YELLOW}$SCRIPT: $F Network/mirror down. Skipping repo .dep comparison.${NORMAL}"
+    return
+  fi 
+
+  echo -n "${BLUE}$SCRIPT: $F dep file compared to repository copy? ${NORMAL}"
+  
+  DEPLIST="$(find -maxdepth 1 -name ${F}.dep)"
+  REPODEP=
+  LOG="/tmp/submitqc/missingdeps/${F}.dep" 
+  DIFFLOG=$LOG.diff 
+ 
+  # see if there is a dep file on the server
+
+  REPODEP=${REPO_URL}/${F}.dep 
+  wget -q --spider ${REPO_URL}/${F}.dep || REPODEP=
+
+  if [ ! $REPODEP ]; then
+    echo "${GREEN}No dep file in repo - done.${NORMAL}"
+    return
+  fi
+ 
+  if [ ! $DEPLIST ]; then
+    echo -e "\n\t${YELLOW}No $F.dep, but exists on mirror. Check manually.${NORMAL}"
+    echo "$F.dep not found, but exists on mirror. Reconfirm." >> /tmp/submitqc/confirmnodeps
+    return
+  fi
+ 
+  # Last case: get remote deplist, diff 
+  wget -q $REPODEP -O /tmp/submitqc/missingdeps/$F.dep.remote \
+  && REPODEP=/tmp/submitqc/missingdeps/$F.dep.remote
+
+  if [ "$(diff -u $REPODEP $DEPLIST)" ]; then 
+    diff -u $REPODEP $DEPLIST > $DIFFLOG 
+    echo -e "\t${YELLOW}There were differences between the remote and local dep lists."
+    echo -e "\t${YELLOW}See $DIFFLOG.${NORMAL}"
+  fi
+  
+  rm -f $REPODEP
+
+  echo -e "\t${GREEN}Ok.${NORMAL}"
+
+}
+
+checkdeps() {
+
+  echo -n "${BLUE}$SCRIPT: $F dependencies exist? ${NORMAL}"
+  
+  DEPLIST="$(find -maxdepth 1 -name ${F}.dep)"
+  LOG="/tmp/submitqc/missingdeps/${F}.dep" 
+
+  if [ ! "$DEPLIST" ]; then
+    echo "${GREEN}No dep file. Ok.${NORMAL}"
+    return
+  fi   
+
+  # do the extensions listed in the dep file end in .tcz? 20151005
+  COUNT=0
+  for DEP in $(cat ${F}.dep); do
+    if [ "${DEP##*.}" != "tcz" ]; then
+      echo -en "\n\t${RED}entry $DEP is invalid - .tcz extension missing.${NORMAL}"    
+      echo "Entry $DEP is invalid - .tcz extension missing." >> $LOG    
+    fi
+    let COUNT=$COUNT+1
+  done 
+
+  if [ $COUNT != "$(wc -l ${F}.dep | cut -f1 -d' ')" ]; then
+    echo -en "\n\t${RED}${F}.dep structure invalid - blank lines or more than one file per line.${NORMAL}"    
+    echo "${F}.dep structure is invalid - extra lines, or not one dep per line." >> $LOG    
+  fi  
+
+  if [ -e "${LOG}" ]; then
+    if [ ${FIXFILES} ]; then
+      echo -en "\n\t${YELLOW}Repairing .dep file ... ${NORMAL}"
+ 
+      # for each line that does -not- end in .tcz, add it.
+      for DEP in $(cat ${F}.dep); do
+        if [ "${DEP##*.}" != "tcz" ]; then
+          DEP="${DEP}.tcz" 
+        fi
+        echo $DEP >> /tmp/submitqc/missingdeps/${F}.dep-new
+      done 
+      mv -f /tmp/submitqc/missingdeps/${F}.dep-new ${F}.dep 
+      [ $? != 0 ] && echo "${RED}Error replacing ${F}.dep with /tmp/submitqc/missingdeps/${F}.dep-new. Halting.${NORMAL}" && exit 1
+      echo -en "\n\t${GREEN}Done!${NORMAL}"
+      echo "These missing filename extensions were appended using --fix." >> $LOG
+    else
+      echo -en "\n\t${YELLOW}Run $SCRIPT with --fix to repair these errors${NORMAL}"
+    fi  
+  fi 
+
+  # does this dep file use the KERNEL variable as needed?
+  if [ "$(grep -qe '-.*-tinycore' ${F}.dep)" ]; then 
+    echo -en "\n\t${YELLOW}Need to use KERNEL variable, not version number. Fixing ...${NORMAL}"
+    sed -i 's/\(.*-\)[0-9].*/\1KERNEL.tcz/' ${F}.dep
+    echo "${YELLOW} Done.${NORMAL}"
+    echo "${F}.dep should use KERNEL variable instead of ver number. Fixed.${NORMAL}" >> $LOG 
+  fi
+
+  [ -z $INET ] && echo -en "${YELLOW}\n\tNetwork/mirror down - remote checking disabled.${NORMAL}"
+  [ $KERNELFORCE ] && echo -en "${YELLOW}\n\tkernel forced to $KVER on commandline${NORMAL}" 
+
+  # check that every dependency is either (1) on mirror or (2) in local directory  
+  echo "" 
+  for DEP in $(cat "${F}.dep"); do
+
+    # make KERNEL variable substitution
+    DEP="$(echo $DEP | sed "s/KERNEL/$KVER/")"
+
+    echo -en "\t${BLUE}$DEP: ${NORMAL}"
+
+    # check if dependency exists on server or locally
+    LOCAL=
+    [ -e "$DEP" ] || [ -e "$REPO/$DEP" ] && LOCAL=1
+    REMOTE=
+    [ $INET ] && wget -q --spider ${REPO_URL}/$DEP && REMOTE=1
+
+    # echo feedback
+    if [ $INET ]; then # both or local
+
+      if [ $REMOTE ]; then
+        echo "${GREEN}found in repository.${NORMAL}"
+      elif [ $LOCAL ]; then
+        echo "${YELLOW}found locally. Submit with extension.${NORMAL}"
+      else
+        echo "${RED}Not found.${NORMAL}"
+	echo "$DEP not local, not remote" >> $LOG
+      fi
+
+    else # no networking. It's either here or it isn't.
+      if [ "$LOCAL" ]; then
+        echo "${YELLOW}$DEP found locally. Submit with extension.${NORMAL}"
+      else
+        echo "${YELLOW}$DEP assumed to be in network repository.${NORMAL}"
+	echo "$DEP not local, remote search disabled." >> $LOG
+      fi 
+    fi
+
+  done # end checking Kernel Module deps  
+
+  # summary statement 
+  if [ -e $LOG ] && [ "$(wc -l $LOG | awk '{print $1}')" != 0 ]; then
+    echo -e "\t${RED}There are warnings or errors. See $LOG${NORMAL}"
+  else
+    echo -e "\t${GREEN}Done.${NORMAL}"  
+    rm -f $LOG 
+  fi
+
+} # end checkdeps()	
+
+checkinfo() {
+
+  echo -n "${BLUE}$SCRIPT: $F info file structure ok? ${NORMAL}"
+
+  if [ ! -f "$F".info ]; then
+    echo -e "\n\t${RED}${F}.info file not found. Do NOT submit without it.${NORMAL}" 
+    echo "$F" >> /tmp/submitqc/noinfofile
+    return
+  fi
+
+  I="$F".info
+  TITLELINE="$(grep -m1 -G "^Title" "$I")"
+  TITLE=$(echo "$TITLELINE" | awk '{print $2}')
+  if [ "$TITLE" != "$F" ]; then
+    [ -z $ERR ] && ERR=1 && echo ""
+    echo -ne "\n\t${YELLOW}$SCRIPT: $I Title field ($TITLE) is missing or incorrect. Fixing. ${NORMAL}"
+    if [ "$TITLE" ]; then 
+      [ "$(echo "$TITLELINE" | grep "TESTING")" ] && TESTING=" TESTING"
+      sed -i "s/^Title.*$/Title:\t\t${F}${TESTING}/" ${I} # edit existing line
+    else
+      sed -i "1iTitle:\t\t${F}\\" ${I} # append missing title to top
+    fi
+    echo "${YELLOW}Done.${NORMAL}"
+    echo "$I title field invalid, fixed." >> /tmp/submitqc/wronginfofile
+  fi
+
+  SIZE=$(du -h "$F" | cut -f 1)
+  SIZE2=$(busybox du -h "$F" | cut -f 1)
+  INFOSIZE="$(cat $I | grep "Size" | awk '{print $2}')"
+  if [ "$INFOSIZE" != "$SIZE" ] && [ "$INFOSIZE" != "$SIZE2" ]; then
+    [ -z $ERR ] && ERR=1 && echo ""
+    echo -en "\n\t${YELLOW}Size field ($INFOSIZE) does not match du output ($SIZE). Fixing. ${NORMAL}"
+    if [ "$(cat $I | grep Size)" ]; then
+      sed -i "s/^Size.*/Size:\t\t$SIZE/" ${I} # edit existing line
+    else
+      sed -i "6iSize:\t\t$SIZE" ${I} # insert
+    fi
+    echo "${YELLOW}Done.${NORMAL}"
+    echo "$I size field invalid, fixed." >> /tmp/submitqc/wronginfofile
+  fi
+
+  for FIELD in Change-log Comments Description Version Author Original-site \
+	Copying-policy "Extension[-_]by" Tags Current; do
+    if [ -z "$(cat "$I" | grep "$FIELD" | awk '{print $2}')" ]; then
+      [ -z $ERR ] && ERR=1 && echo ""
+      echo -e "\t${RED}$FIELD missing or invalid. Fix before submitting.${NORMAL}"
+      echo "$I: $FIELD field is missing or invalid." >> /tmp/submitqc/wronginfofile
+    fi
+  done
+
+  if [ "$(file $I | grep CRLF)" ]; then
+    ERR=1
+    echo -ne "\n\t${YELLOW}$SCRIPT: $I uses Windows-like CRLF terminators. Fixing. ${NORMAL}"
+    dos2unix -u $I
+    echo "$I uses Windows-like CRLF terminators. Fixed." >> /tmp/submitqc/wronginfofile
+    echo "${YELLOW}Done.${NORMAL}"
+  fi
+
+  [ -z $ERR ] && echo "${GREEN}Ok.${NORMAL}"
+
+} # end checkinfo()
+
+# check md5sum.txt
+checkmd5sums() {
+
+  echo -n "${BLUE}$SCRIPT: $F checking md5.txt. ${NORMAL}"
+  MD5=${F}.md5.txt
+  if [ ! -f "$MD5" ] || [ "$(cat ${MD5})" != "$(md5sum ${F})" ]; then
+    echo -en "\n\t${YELLOW}${F} md5 mismatch - creating new ${MD5} ... ${NORMAL}"
+    md5sum ${F} > ${MD5} 
+    echo ${F} >> /tmp/submitqc/wrongmd5
+    echo "${YELLOW}Done.${NORMAL}"
+  else 
+    echo "${GREEN}Ok.${NORMAL}"
+  fi 
+  
+}
+
+# make zsync file
+makezsync() {
+ 
+  LOG=/tmp/submitqc/zsync.$F
+  rm -f $LOG
+
+  if [ "$ARCH" = "armv7" ]; then
+    echo "${YELLOW}$SCRIPT: skipping zsync creation - zsync support uncertain on armv7. Please \
+submit zsync availability (script patches?) to maintainer."
+    echo "$SCRIPT: $F.zsync not created; unknown whether armv7 has zsync support. Please report." \
+      > $LOG 
+    return
+  fi 
+ 
+  echo -n "${BLUE}$SCRIPT: $F creating new $F.zsync ${NORMAL}"
+  rm -f ${F}.zsync 
+  zsyncmake -u ${F} ${F} 
+  if [ $? != 0 ]; then 
+    echo -e "\n\t${RED}$SCRIPT: unknown error creating $F.zsync. Re-make manually.${NORMAL}" 
+    echo "${RED}Do NOT submit without zsync file.${NORMAL}"
+    echo "$SCRIPT: unknown error creating $F.zsync. Re-make manually." > $LOG 
+  else
+    echo "${GREEN}Done.${NORMAL}"
+  fi
+
+}
+
+# Re-squash SQUASHDIR, use new file to replace F 
+rebuild() {
+  
+  echo -n "${BLUE}$SCRIPT: make squashfs with changes ... ${NORMAL}"
+
+  # original:
+  #if [ "$BADPERM" == "1" ]; then
+  #for I in `find "$F".123456789/ -type d`; do stat -c '%a' "$I" | grep 755 >/dev/null || \
+  #stat -c '%a' "$I" | grep 775 >/dev/null || stat -c '%a' "$I" | grep 2755 >/dev/null || \
+  #stat -c '%a' "$I" | grep 2775 >/dev/null || chmod 755 "$I" ; done
+  #fi
+
+  # make new/fixed extension 
+  sudo rm -f "$F".new # jic
+  sudo mksquashfs ${SQUASHDIR} "$F".new -b 4096 -noappend > /dev/null # noappend suggested by robc
+  [ $? != 0 ] && echo "${RED}$SCRIPT: there was an error in mksquashfs. Halting." && exit 1
+  sudo chmod 664 ${F}.new
+  sudo chown tc:staff ${F}.new
+  mv "$F".new "$F"
+
+  # make list and md5 
+  md5sum ${F} > ${F}.md5.txt
+  find ${SQUASHDIR} -not -type d | sed "s/${SQUASHDIR}//" > ${F}.list 
+
+  echo "${GREEN}Done. ${F} + ${F}.md5.txt updated.${NORMAL}"
+
+} # end rebuild()
+
+# look for date, version, build-deps, build-args
+checkbuilddep() {
+  
+  echo -n "${BLUE}$SCRIPT: $F.build-dep or build-dep included?${NORMAL}"
+
+  if [ ! -e "$F.build-dep" ] && [ ! -e "build-dep" ]; then
+    echo -e "\n\t${GREEN}Not found, but it is suggested/requested.${NORMAL}"
+    return
+  fi
+
+  echo "${GREEN}Yes - thanks!${NORMAL}"
+  
+}
+
+# look tgz that contains source & script 
+checktgz() {
+  
+  echo -n "${BLUE}$SCRIPT: $F.tgz included?${NORMAL}"
+
+  if [ ! -e "$F.tgz" ]; then 
+    echo -e "\n\t${GREEN}Not found, but it is suggested/requested.${NORMAL}"
+    return
+  fi
+
+  # check file type - I think this should be xz?
+  # check file content
+
+  echo "${GREEN}Yes - thanks!${NORMAL}"
+  
+}
+
+####################
+#########################
+# MAIN STUFF BEGINS 
+#########################
+####################
+
+trap cleanonsignal SIGHUP SIGINT SIGQUIT SIGTERM SIGSTOP SIGABRT
+
+announce # intro text
+
+# self-package! =D
+if [ $PACKAGING ]; then
+  selfpackage
+  exit
+fi
+
+loadextensions # load coreutils & the like
+cleanuplogs # remove old logs, create new log dir at /tmp/submitqc
+checknetwork # connect to mirror if possible
+
+######################
+# TESTING LOOP
+######################
+
+for F in $TCZLIST; do 
+
+  echo ""
+  echo "${BLUE}$SCRIPT: $F checks begin ===== ${NORMAL}"
+
+  # ensure squashfs has something in it
+  checkempty || { 
+    echo "${RED}$SCRIPT: $F testing aborted. Fix squashfs and re-test.${NORMAL}"
+    continue
+  }
+
+  # allocate a folder for unsquashing & checking the extension 
+  BASENAME="$(basename "$F" .tcz)"
+  SQUASHDIR="${BASENAME}.submitqc.$(date +%s | md5sum | head -c4)" 
+
+  TEMPLIST="$SQUASHDIR" 
+  
+  # in particular, dep check/fix should be before lib checking (in loop below)  
+  checkinfo # check fields exist, etc.
+  checkmaintainer # check maintainer, look for similar extension names
+  checkremotedep # check exists, check against repo copy
+  checkdeps # check each dependency exists (NOT recursive)
+
+  checkmount # try to mount. Returns 0 on success, 1 on failure
+
+  if [ $? = 0 ]; then 
+    
+    CHANGES= # set to 1 when the script changes some details 
+
+    checkblock # ensure F was made with mksquash -b 4096
+   
+    #####
+    # this section runs tests from within the squashfs root directory
+    #####
+
+      (
+      echo -n "${BLUE}$SCRIPT: $F unsquashing for further tests ... ${NORMAL}" 
+      sudo unsquashfs -d ${SQUASHDIR} ${F} > /dev/null # unsquash to check
+      echo "${GREEN}Done.${NORMAL}" 
+      ) &
+      rotdash $!
+
+      cd ${SQUASHDIR} # do all the checks from here
+ 
+      # valid squashfs? 1 and only 1? 
+      checkappend || { 
+        echo "${RED}$SCRIPT: $F testing aborted. Fix squashfs and re-test.${NORMAL}"
+	cd "$RUNDIR"
+        sudo rm -rf ${SQUASHDIR}
+        TEMPLIST=
+        continue
+      }
+ 
+      checkstartup # check/fix tce.installed (775, root:staff, one script of same name as ext)
+      checkcopyright # look for COPYING or other doc at usr/local/share/doc/$F
+      checkfileperms # check/fix directory & file permissions. Fix on --fix.
+      checkstripping # ensure binaries/libraries have been stripped. Strip on --strip.
+      checklist # check list file against squashfs and repo
+
+      checklibs # check what binary dependencies the included binaries contain ...
+    
+      cd "$RUNDIR" # return to rundir
+
+    #####
+    # returned to rundir
+    #####
+ 
+    [ "$CHANGES" ] && rebuild # commit changes to new tcz file
+
+    checkmd5sums
+
+    (
+    echo -n "${BLUE}${SCRIPT}: $F squash tree checks complete. Cleaning up ... ${NORMAL}" 
+    sudo rm -rf ${SQUASHDIR}
+    echo "${GREEN}Done.${NORMAL}" 
+    TEMPLIST=
+    ) &
+    rotdash $!
+
+    makezsync # create new zsync file, jic
+
+    checkbuilddep # check for build-dep text file 
+    checktgz # check for .tgz (source & script) file
+
+    # Permissions/ownership cleanup 
+    echo -n "${BLUE}$SCRIPT: $F: setting ownership & permissions of ${F}* ... ${NORMAL}"
+    find -maxdepth 1 -type f -name "${F}.tcz*" -exec sudo chown tc:staff {} \;
+    find -maxdepth 1 -type f -name "${F}.tcz*" -exec sudo chmod 664 {} \;
+    echo "${GREEN}Ok!${NORMAL}" 
+
+  fi # end if [ it was mount-able and test-able ]
+   
+  echo "${BLUE}$SCRIPT: $F checks end ===== ${NORMAL}"
+
+done # end loop all extensions
+
+
+#############
+# REPORTING
+#############
+
+# list all the log files with content
+cd /tmp/submitqc
+LOGLIST="$(find -type f -exec ls -s {} \; | sed '/^0/d' | sed 's/\.\///' | \
+  sed '/.info.lst/d' | awk '{print $2}'; \
+  [ -e "missingdeps" ] && find missingdeps -not -type d;
+  [ -e "listfilediffs" ] && find listfilediffs -not -type d;)"
+
+# report!
+echo ""
+echo ""
+if [ "$LOGLIST" ] && [ "$(cat $LOGLIST)" ]; then
+  echo "${RED}${SCRIPT}: There are warnings or errors for your extensions. See:${NORMAL}"
+  echo "$LOGLIST" | sed 's/^/\t\t\/tmp\/submitqc\//' | sort | uniq
+  echo -e "${RED}\tSome errors may have been corrected - see logs and above.${NORMAL}"
+  echo -e "${RED}\tFix errors and run $SCRIPT again before submitting.${NORMAL}"
+  echo -e "${RED}\tLog files will be destroyed the next time $SCRIPT is run.$NORMAL"
+  echo -e "${RED}\tWithout warnings or errors, this message will go away.${NORMAL}"
+else
+  echo "${BLUE}${SCRIPT}: ${GREEN}All extensions passed! Ready for submission.${NORMAL}"
+fi
+

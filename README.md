@@ -1,2 +1,2 @@
-# ssrext
-Simple Screen Recorder extension for Tiny Core Linux x86_64
+# Simple Screen Recorder
+Extension for Tiny Core Linux x86_64

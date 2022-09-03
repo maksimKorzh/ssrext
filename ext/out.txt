@@ -1,0 +1,54 @@
+
+==============================================================
+This is the Tiny Core extension submission quality testing tool.
+This pre-release is UNDER TESTING for TC5/6 and x86/x86_64.
+
+see --help for usage instructions.
+
+Release: SOURCE RUN
+==============================================================
+
+Checking against Core release 13.x on x86_64 / 5.15.10-tinycore64 
+
+submitqc: loading required extensions ... Done.
+submitqc: removing old log files. Ok.
+submitqc: making space for new log files. Done.
+/submitqc: checking http://repo.tinycorelinux.net/ (timeout 3 sec) ... Connected!
+submitqc: fetching info.lst.gz ... Ok.
+
+submitqc: simplescreenrecorder.tcz checks begin ===== 
+submitqc: simplescreenrecorder.tcz squashfs tree has files in it? Ok.
+submitqc: simplescreenrecorder.tcz info file structure ok? Ok.
+submitqc: simplescreenrecorder.tcz info similar to others in repository? Ok.
+submitqc: simplescreenrecorder.tcz dep file compared to repository copy? No dep file in repo - done.
+submitqc: simplescreenrecorder.tcz dependencies exist? 
+	ffmpeg4.tcz: found in repository.
+	jack.tcz: found in repository.
+	Done.
+submitqc: simplescreenrecorder.tcz mountable? /-\|/-\|/-\|/-\|/-\|/Passed mount check.
+submitqc: simplescreenrecorder.tcz correct block size? Yes.
+submitqc: simplescreenrecorder.tcz unsquashing for further tests ... /Done.
+submitqc: simplescreenrecorder.tcz squashfs tree ok? Ok.
+submitqc: simplescreenrecorder.tcz startup files ok? None present. Ok, I think.
+submitqc: simplescreenrecorder.tcz includes copyright notice? Looks ok.
+submitqc: simplescreenrecorder.tcz file/directory ownerships & permissions ok? /-\|/-\|/-Ok.
+submitqc: simplescreenrecorder.tcz binaries have been stripped? /-\|/Ok.
+submitqc: simplescreenrecorder.tcz list file looks ok? Ok.
+submitqc: simplescreenrecorder.tcz comparing list to mirror copy. Not on mirror. 
+submitqc: simplescreenrecorder.tcz dep file includes all necessary libraries? /-\|/
+	WARNING: dependency v4l-dvb-KERNEL.tcz missing - tests will be inconclusive.
+Ok!
+
+	WARNING: error during tests - inconclusive
+submitqc: simplescreenrecorder.tcz checking md5.txt. Ok.
+submitqc: simplescreenrecorder.tcz squash tree checks complete. Cleaning up ... /Done.
+submitqc: simplescreenrecorder.tcz creating new simplescreenrecorder.tcz.zsync Done.
+submitqc: simplescreenrecorder.tcz.build-dep or build-dep included?
+	Not found, but it is suggested/requested.
+submitqc: simplescreenrecorder.tcz.tgz included?
+	Not found, but it is suggested/requested.
+submitqc: simplescreenrecorder.tcz: setting ownership & permissions of simplescreenrecorder.tcz* ... Ok!
+submitqc: simplescreenrecorder.tcz checks end ===== 
+
+
+submitqc: All extensions passed! Ready for submission.
